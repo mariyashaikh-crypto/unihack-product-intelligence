@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+backend/data/uploads/
+backend/data/documents.json
+frontend/node_modules/
+frontend/dist/
+frontend/react-app/
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

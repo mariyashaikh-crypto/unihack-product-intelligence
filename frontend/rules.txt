@@ -1,0 +1,129 @@
+PROJECT RULES
+
+1. SCOPE
+- You are working ONLY inside the frontend folder.
+- NEVER modify, delete, rename, or create anything inside ../backend.
+- Treat the backend API as an external service.
+- Do not change backend Python files, backend requirements, backend data, or backend configuration.
+
+2. FRONTEND GOAL
+Build a polished Product Intelligence dashboard for uploading product documents/images and asking questions about them.
+
+3. CORE USER FLOW
+Upload PDF/image
+→ show upload progress
+→ receive document_id
+→ show uploaded document
+→ user asks a question
+→ call backend /query with document_id
+→ display answer, confidence, validation status, evidence and source pages.
+
+4. SUPPORTED FILES
+- PDF
+- PNG
+- JPG
+- JPEG
+- WEBP
+
+5. BACKEND API
+Base URL:
+http://127.0.0.1:8000
+
+Endpoints:
+GET  /health
+GET  /documents
+POST /upload
+POST /query
+GET  /documents/{document_id}/file
+
+Upload:
+multipart/form-data
+field name: file
+
+Query body:
+{
+  "document_id": "<id>",
+  "question": "<question>",
+  "top_k": 3
+}
+
+6. API SAFETY
+- Never invent API responses.
+- Handle loading, success, empty, no_evidence, conflict, validation_failed, visual_evidence_only, and server errors.
+- Never display fake confidence or fake evidence.
+- If backend returns no_evidence, clearly tell the user the document does not contain sufficient evidence.
+- If backend returns visual_evidence_only, explain that the uploaded visual document has no readable text available for text retrieval.
+
+7. DESIGN
+Use the supplied dashboard screenshot only as visual inspiration.
+
+Visual direction:
+- white/light background
+- very light gray-blue surfaces
+- blue primary accent
+- compact left navigation
+- clean top header
+- rounded cards
+- subtle borders
+- soft shadows
+- small status pills
+- strong typography hierarchy
+- generous spacing
+- restrained use of color
+- professional enterprise/SaaS appearance
+
+Do NOT clone the reference screenshot literally.
+Do NOT use the StadiumOS branding, logos, names, or sports content.
+
+8. RESPONSIVENESS
+The frontend must work on:
+- desktop
+- laptop
+- tablet
+- mobile
+
+9. UX
+- Upload should be obvious.
+- Question input should be the main interaction after a document is uploaded.
+- Answer should be visually dominant.
+- Confidence and validation status should be easy to understand.
+- Evidence should be expandable.
+- Page numbers should be clearly visible.
+- Include useful empty states.
+
+10. CODE QUALITY
+- Use reusable React components.
+- Keep API calls in a dedicated frontend API module.
+- Keep UI components separate from API logic.
+- Avoid giant single-file components.
+- Use clear naming.
+- Avoid unnecessary dependencies.
+- Do not add libraries unless genuinely useful.
+- Do not use mock data in production UI paths.
+- Never hard-code WP-450-specific UI content.
+
+11. STATE
+Maintain frontend state for:
+- selected document
+- upload status
+- document metadata
+- question
+- query loading
+- answer
+- confidence
+- evidence
+- errors
+
+12. SECURITY
+- Do not expose secrets.
+- Do not add API keys.
+- Do not commit credentials.
+- Do not add paid API dependencies.
+
+13. FINAL CHECK
+Before finishing:
+- run frontend build
+- fix all build errors
+- ensure no backend files were modified
+- ensure API calls use the documented endpoints
+- ensure the application works with a real uploaded document
