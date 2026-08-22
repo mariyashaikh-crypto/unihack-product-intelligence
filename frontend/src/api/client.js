@@ -1,8 +1,13 @@
-const BASE_URL = 
+import { extractBrowserText } from '../utils/browserOcr';
+
+const BASE_URL =
   'https://unihack-product-intelligence-2.onrender.com';
 
 export class ApiError extends Error {
-  constructor(message, { status = 0, details = null } = {}) {
+  constructor(
+    message,
+    { status = 0, details = null } = {},
+  ) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
@@ -10,14 +15,23 @@ export class ApiError extends Error {
   }
 }
 
-function extractErrorMessage(payload, status) {
-  if (payload && typeof payload === 'object') {
+function extractErrorMessage(
+  payload,
+  status,
+) {
+  if (
+    payload &&
+    typeof payload === 'object'
+  ) {
     const detail =
       payload.detail ??
       payload.message ??
       payload.error;
 
-    if (typeof detail === 'string' && detail.trim()) {
+    if (
+      typeof detail === 'string' &&
+      detail.trim()
+    ) {
       return detail;
     }
 
@@ -67,12 +81,13 @@ async function request(
   }
 
   let payload = null;
-
-  const rawBody = await response.text();
+  const rawBody =
+    await response.text();
 
   if (rawBody) {
     try {
-      payload = JSON.parse(rawBody);
+      payload =
+        JSON.parse(rawBody);
     } catch {
       payload = rawBody;
     }
@@ -300,11 +315,8 @@ export function normalizeQueryResult(
     null;
 
   let nestedConfidence = null;
-
   let nestedEvidence = [];
-
   let pages = [];
-
   let evidenceCount = null;
 
   if (
@@ -341,15 +353,18 @@ export function normalizeQueryResult(
     };
 
     validationStatus =
-      (typeof answerRaw.status ===
-      'string'
-        ? answerRaw.status
-        : null) ??
+      (
+        typeof answerRaw.status ===
+        'string'
+          ? answerRaw.status
+          : null
+      ) ??
       validationStatus;
 
-    pages = normalizePages(
-      answerRaw.pages,
-    );
+    pages =
+      normalizePages(
+        answerRaw.pages,
+      );
 
     evidenceCount =
       toNullableNumber(
@@ -391,8 +406,7 @@ export function normalizeQueryResult(
 
   return {
     status:
-      typeof raw.status ===
-      'string'
+      typeof raw.status === 'string'
         ? raw.status
         : null,
 
@@ -407,12 +421,11 @@ export function normalizeQueryResult(
     confidence:
       toNullableNumber(
         raw.confidence,
-      ) ?? nestedConfidence,
+      ) ??
+      nestedConfidence,
 
     validationStatus,
-
     pages,
-
     evidenceCount,
 
     evidence:
@@ -437,9 +450,8 @@ export function getDocumentFileUrl(
 }
 
 export async function listDocuments() {
-  const payload = await request(
-    '/documents',
-  );
+  const payload =
+    await request('/documents');
 
   const candidates =
     Array.isArray(payload)
@@ -477,9 +489,8 @@ export async function queryDocument({
     );
   }
 
-  const payload = await request(
-    '/query',
-    {
+  const payload =
+    await request('/query', {
       method: 'POST',
 
       headers: {
@@ -492,8 +503,7 @@ export async function queryDocument({
         question,
         top_k: topK,
       }),
-    },
-  );
+    });
 
   return normalizeQueryResult(
     payload,
@@ -510,95 +520,118 @@ export async function uploadDocument(
     );
   }
 
-  if (
-    typeof onProgress ===
-    'function'
-  ) {
-    onProgress(0);
-  }
-
-  const formData =
-    new FormData();
-
-  formData.append(
-    'file',
-    file,
-  );
-
-  let response;
-
   try {
-    response = await fetch(
-      `${BASE_URL}/upload`,
-      {
-        method: 'POST',
-        body: formData,
-      },
-    );
-  } catch {
-    throw new ApiError(
-      `Unable to reach the backend at ${BASE_URL}.`,
-    );
-  }
+    // Browser OCR happens here.
+    const ocrPages =
+      await extractBrowserText(
+        file,
+        {
+          onProgress,
+        },
+      );
 
-  let payload = null;
-
-  const rawBody =
-    await response.text();
-
-  if (rawBody) {
-    try {
-      payload =
-        JSON.parse(rawBody);
-    } catch {
-      payload = rawBody;
+    if (
+      typeof onProgress ===
+      'function'
+    ) {
+      onProgress(92);
     }
-  }
 
-  if (!response.ok) {
-    throw new ApiError(
-      extractErrorMessage(
+    const formData =
+      new FormData();
+
+    formData.append(
+      'file',
+      file,
+    );
+
+    formData.append(
+      'ocr_pages',
+      JSON.stringify(ocrPages),
+    );
+
+    const response =
+      await fetch(
+        `${BASE_URL}/upload`,
+        {
+          method: 'POST',
+          body: formData,
+        },
+      );
+
+    let payload = null;
+
+    const rawBody =
+      await response.text();
+
+    if (rawBody) {
+      try {
+        payload =
+          JSON.parse(rawBody);
+      } catch {
+        payload = rawBody;
+      }
+    }
+
+    if (!response.ok) {
+      throw new ApiError(
+        extractErrorMessage(
+          payload,
+          response.status,
+        ),
+        {
+          status:
+            response.status,
+
+          details:
+            payload &&
+            typeof payload ===
+              'object'
+              ? payload
+              : null,
+        },
+      );
+    }
+
+    const documentId =
+      pickDocumentId(
         payload,
-        response.status,
-      ),
-      {
-        status:
-          response.status,
+      );
 
-        details:
-          payload &&
-          typeof payload ===
-            'object'
-            ? payload
-            : null,
-      },
-    );
-  }
+    if (!documentId) {
+      throw new ApiError(
+        'The upload succeeded but the backend did not return a document id.',
+        {
+          status:
+            response.status,
+        },
+      );
+    }
 
-  const documentId =
-    pickDocumentId(
+    if (
+      typeof onProgress ===
+      'function'
+    ) {
+      onProgress(100);
+    }
+
+    return normalizeDocument(
       payload,
+      documentId,
+    );
+  } catch (error) {
+    if (error instanceof ApiError) {
+      throw error;
+    }
+
+    console.error(
+      'Document upload failed:',
+      error,
     );
 
-  if (!documentId) {
     throw new ApiError(
-      'The upload succeeded but the backend did not return a document id.',
-      {
-        status:
-          response.status,
-      },
+      error?.message ||
+        'Unable to process the document.',
     );
   }
-
-  if (
-    typeof onProgress ===
-    'function'
-  ) {
-    onProgress(100);
-  }
-
-  return normalizeDocument(
-    payload,
-    documentId,
-  );
 }

@@ -1,3 +1,5 @@
+import gc
+import json
 import mimetypes
 import tempfile
 from pathlib import Path
@@ -6,19 +8,21 @@ from uuid import uuid4
 from fastapi import (
     FastAPI,
     File,
+    Form,
     HTTPException,
     UploadFile,
 )
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.cors import (
+    CORSMiddleware,
+)
 from fastapi.responses import Response
 from pydantic import BaseModel
 
-from app.services.chunker import create_chunks
+from app.services.chunker import (
+    create_chunks,
+)
 from app.services.document_processor import (
     extract_document,
-)
-from app.services.query_pipeline import (
-    ProductQueryPipeline,
 )
 from app.services.supabase_store import (
     SupabaseStore,
@@ -31,10 +35,6 @@ app = FastAPI(
     version="1.0.0",
 )
 
-
-# ---------------------------------------------------------
-# CORS
-# ---------------------------------------------------------
 
 app.add_middleware(
     CORSMiddleware,
@@ -50,19 +50,11 @@ app.add_middleware(
 )
 
 
-# ---------------------------------------------------------
-# Request model
-# ---------------------------------------------------------
-
 class QueryRequest(BaseModel):
     question: str
     document_id: str
     top_k: int = 3
 
-
-# ---------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------
 
 ALLOWED_EXTENSIONS = {
     ".pdf",
@@ -71,6 +63,13 @@ ALLOWED_EXTENSIONS = {
     ".jpeg",
     ".webp",
 }
+
+MAX_UPLOAD_MB = 25
+MAX_UPLOAD_BYTES = (
+    MAX_UPLOAD_MB *
+    1024 *
+    1024
+)
 
 
 def get_store() -> SupabaseStore:
@@ -82,7 +81,9 @@ def get_content_type(
 ) -> str:
 
     content_type, _ = (
-        mimetypes.guess_type(filename)
+        mimetypes.guess_type(
+            filename
+        )
     )
 
     return (
@@ -91,66 +92,133 @@ def get_content_type(
     )
 
 
-# ---------------------------------------------------------
-# Root
-# ---------------------------------------------------------
+def _parse_ocr_pages(
+    raw: str | None,
+) -> list[dict]:
+
+    if not raw:
+        return []
+
+    try:
+        value = json.loads(
+            raw
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Invalid browser OCR data."
+            ),
+        ) from exc
+
+    if not isinstance(value, list):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Browser OCR data must be a list."
+            ),
+        )
+
+    pages = []
+
+    for item in value:
+        if not isinstance(
+            item,
+            dict,
+        ):
+            continue
+
+        try:
+            page_number = int(
+                item.get(
+                    "page",
+                    len(pages) + 1,
+                )
+            )
+        except Exception:
+            page_number = (
+                len(pages) + 1
+            )
+
+        text = str(
+            item.get(
+                "text",
+                "",
+            )
+        ).strip()
+
+        if text:
+            pages.append(
+                {
+                    "page": page_number,
+                    "text": text,
+                    "has_text": True,
+                    "native_text": "",
+                    "ocr_text": text,
+                    "has_images": True,
+                    "image_count": 1,
+                    "images": [],
+                    "ocr_used": True,
+                    "source_type": (
+                        "browser_ocr"
+                    ),
+                    "source": "",
+                }
+            )
+
+    return pages
+
 
 @app.get("/")
 def root():
     return {
         "status": "success",
-        "message": "Product Intelligence API is running",
+        "message": (
+            "Product Intelligence API is running"
+        ),
     }
 
 
-# ---------------------------------------------------------
-# Health
-# ---------------------------------------------------------
-
 @app.get("/health")
 def health():
-    # We intentionally check that the Supabase connection
-    # can be initialized. This catches missing environment
-    # variables on Render.
+
     try:
         get_store()
 
         return {
             "status": "healthy",
             "storage": "supabase",
+            "ocr": "browser",
         }
 
     except Exception as exc:
 
         raise HTTPException(
             status_code=503,
-            detail=(
-                "Supabase storage is not configured: "
-                f"{exc}"
-            ),
+            detail=str(exc),
         )
 
-
-# ---------------------------------------------------------
-# Upload
-# ---------------------------------------------------------
 
 @app.post("/upload")
 async def upload_document(
     file: UploadFile = File(...),
+    ocr_pages: str | None = Form(
+        default=None
+    ),
 ):
+
     if not file.filename:
         raise HTTPException(
             status_code=400,
             detail="No filename provided.",
         )
 
-    original_filename = Path(
+    filename = Path(
         file.filename
     ).name
 
     extension = Path(
-        original_filename
+        filename
     ).suffix.lower()
 
     if extension not in ALLOWED_EXTENSIONS:
@@ -166,24 +234,27 @@ async def upload_document(
         uuid4()
     )
 
-    storage_path = (
-        f"{document_id}/"
-        f"{original_filename}"
-    )
-
     content_type = (
         file.content_type
         or get_content_type(
-            original_filename
+            filename
         )
+    )
+
+    storage_path = (
+        f"{document_id}/{filename}"
     )
 
     store = get_store()
 
-    temp_path: Path | None = None
+    temp_path = None
+    content = None
 
     try:
-        content = await file.read()
+
+        content = await file.read(
+            MAX_UPLOAD_BYTES + 1
+        )
 
         if not content:
             raise HTTPException(
@@ -191,27 +262,48 @@ async def upload_document(
                 detail="Uploaded file is empty.",
             )
 
-        # -------------------------------------------------
-        # Temporary local file for OCR/document processing
-        # -------------------------------------------------
-
-        with tempfile.NamedTemporaryFile(
-            suffix=extension,
-            delete=False,
-        ) as temp_file:
-
-            temp_file.write(content)
-            temp_path = Path(
-                temp_file.name
+        if len(content) > MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"File is too large. "
+                    f"Maximum allowed size is "
+                    f"{MAX_UPLOAD_MB} MB."
+                ),
             )
 
+        browser_pages = _parse_ocr_pages(
+            ocr_pages
+        )
+
         # -------------------------------------------------
-        # Extract text / OCR
+        # Prefer browser OCR/text.
+        # This means Render does NOT run OCR.
         # -------------------------------------------------
 
-        pages = extract_document(
-            str(temp_path)
-        )
+        if browser_pages:
+
+            pages = browser_pages
+
+        else:
+
+            # Fallback for text-based PDFs.
+            with tempfile.NamedTemporaryFile(
+                suffix=extension,
+                delete=False,
+            ) as temp_file:
+
+                temp_file.write(
+                    content
+                )
+
+                temp_path = Path(
+                    temp_file.name
+                )
+
+            pages = extract_document(
+                str(temp_path)
+            )
 
         text_pages = [
             page
@@ -236,7 +328,10 @@ async def upload_document(
             )
             or page.get(
                 "source_type"
-            ) == "image"
+            ) in {
+                "image",
+                "browser_ocr",
+            }
             for page in pages
         )
 
@@ -252,10 +347,6 @@ async def upload_document(
                 ),
             )
 
-        # -------------------------------------------------
-        # Persistent Supabase storage
-        # -------------------------------------------------
-
         store.upload_file(
             storage_path=storage_path,
             file_bytes=content,
@@ -264,7 +355,7 @@ async def upload_document(
 
         store.create_document(
             document_id=document_id,
-            filename=original_filename,
+            filename=filename,
             content_type=content_type,
             pages=len(pages),
             chunks=len(chunks),
@@ -280,7 +371,7 @@ async def upload_document(
         return {
             "status": "success",
             "document_id": document_id,
-            "filename": original_filename,
+            "filename": filename,
             "pages": len(pages),
             "chunks": len(chunks),
             "visual_only": not bool(chunks),
@@ -295,11 +386,16 @@ async def upload_document(
 
     except Exception as exc:
 
-        # If the database/storage write failed after
-        # uploading the file, remove the uploaded file.
         try:
             store.delete_file(
                 storage_path
+            )
+        except Exception:
+            pass
+
+        try:
+            store.delete_document(
+                document_id
             )
         except Exception:
             pass
@@ -312,7 +408,6 @@ async def upload_document(
     finally:
 
         if temp_path is not None:
-
             try:
                 temp_path.unlink(
                     missing_ok=True
@@ -320,15 +415,15 @@ async def upload_document(
             except Exception:
                 pass
 
+        content = None
+        gc.collect()
 
-# ---------------------------------------------------------
-# List documents
-# ---------------------------------------------------------
 
 @app.get("/documents")
 def list_documents():
 
     try:
+
         store = get_store()
 
         documents = (
@@ -346,35 +441,28 @@ def list_documents():
             result.append(
                 {
                     "document_id": document_id,
-
                     "filename": document.get(
                         "filename"
                     ),
-
                     "content_type": document.get(
                         "content_type"
                     ),
-
                     "pages": document.get(
                         "pages",
                         0,
                     ),
-
                     "chunks": document.get(
                         "chunks",
                         0,
                     ),
-
                     "visual_only": document.get(
                         "visual_only",
                         False,
                     ),
-
                     "file_url": (
                         f"/documents/"
                         f"{document_id}/file"
                     ),
-
                     "created_at": document.get(
                         "created_at"
                     ),
@@ -392,10 +480,6 @@ def list_documents():
             detail=str(exc),
         )
 
-
-# ---------------------------------------------------------
-# Download stored document
-# ---------------------------------------------------------
 
 @app.get(
     "/documents/{document_id}/file"
@@ -427,7 +511,9 @@ def get_document_file(
         if not storage_path:
             raise HTTPException(
                 status_code=404,
-                detail="Document storage path not found.",
+                detail=(
+                    "Document storage path not found."
+                ),
             )
 
         file_bytes = (
@@ -463,10 +549,6 @@ def get_document_file(
         )
 
 
-# ---------------------------------------------------------
-# Query
-# ---------------------------------------------------------
-
 @app.post("/query")
 def query_product(
     request: QueryRequest,
@@ -491,7 +573,6 @@ def query_product(
         )
 
         if not document:
-
             raise HTTPException(
                 status_code=404,
                 detail=(
@@ -506,35 +587,40 @@ def query_product(
         ):
 
             return {
-                "status": "visual_evidence_only",
-                "document_id": request.document_id,
+                "status": (
+                    "visual_evidence_only"
+                ),
+                "document_id": (
+                    request.document_id
+                ),
                 "question": question,
                 "confidence": 0.0,
                 "answer": None,
                 "evidence": [],
-                "message": (
-                    "The document contains visual "
-                    "content but no readable text "
-                    "was detected."
-                ),
             }
 
-        chunks = (
-            store.get_chunks(
-                request.document_id
-            )
+        chunks = store.get_chunks(
+            request.document_id
         )
 
         if not chunks:
 
             return {
                 "status": "no_evidence",
-                "document_id": request.document_id,
+                "document_id": (
+                    request.document_id
+                ),
                 "question": question,
                 "confidence": 0.0,
                 "answer": None,
                 "evidence": [],
             }
+
+        # Lazy import so sklearn is not loaded
+        # into the upload/OCR path.
+        from app.services.query_pipeline import (
+            ProductQueryPipeline,
+        )
 
         pipeline = ProductQueryPipeline(
             chunks=chunks
@@ -550,7 +636,9 @@ def query_product(
                 "status",
                 "success",
             ),
-            "document_id": request.document_id,
+            "document_id": (
+                request.document_id
+            ),
             "question": question,
             "confidence": result.get(
                 "confidence",
@@ -574,3 +662,6 @@ def query_product(
             status_code=500,
             detail=str(exc),
         )
+
+    finally:
+        gc.collect()
