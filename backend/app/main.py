@@ -1,15 +1,28 @@
-import json
+import mimetypes
+import tempfile
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, UploadFile, File
-from fastapi.responses import FileResponse
+from fastapi import (
+    FastAPI,
+    File,
+    HTTPException,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel
 
-from app.services.document_processor import extract_document
 from app.services.chunker import create_chunks
-from app.services.query_pipeline import ProductQueryPipeline
+from app.services.document_processor import (
+    extract_document,
+)
+from app.services.query_pipeline import (
+    ProductQueryPipeline,
+)
+from app.services.supabase_store import (
+    SupabaseStore,
+)
 
 
 app = FastAPI(
@@ -38,18 +51,6 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------
-# Paths
-# ---------------------------------------------------------
-
-BASE_DIR = Path(__file__).resolve().parent.parent
-
-UPLOAD_DIR = BASE_DIR / "data" / "uploads"
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
-DOCUMENT_STORE = BASE_DIR / "data" / "documents.json"
-
-
-# ---------------------------------------------------------
 # Request model
 # ---------------------------------------------------------
 
@@ -60,41 +61,34 @@ class QueryRequest(BaseModel):
 
 
 # ---------------------------------------------------------
-# Persistent document storage
+# Helpers
 # ---------------------------------------------------------
 
-def _load_documents() -> dict:
-
-    if not DOCUMENT_STORE.exists():
-        return {}
-
-    try:
-        data = json.loads(
-            DOCUMENT_STORE.read_text(
-                encoding="utf-8"
-            )
-        )
-
-        return data if isinstance(data, dict) else {}
-
-    except Exception:
-        return {}
+ALLOWED_EXTENSIONS = {
+    ".pdf",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+}
 
 
-def _save_documents(
-    documents: dict
-) -> None:
+def get_store() -> SupabaseStore:
+    return SupabaseStore()
 
-    DOCUMENT_STORE.write_text(
-        json.dumps(
-            documents,
-            indent=2
-        ),
-        encoding="utf-8"
+
+def get_content_type(
+    filename: str,
+) -> str:
+
+    content_type, _ = (
+        mimetypes.guess_type(filename)
     )
 
-
-documents = _load_documents()
+    return (
+        content_type
+        or "application/octet-stream"
+    )
 
 
 # ---------------------------------------------------------
@@ -103,7 +97,6 @@ documents = _load_documents()
 
 @app.get("/")
 def root():
-
     return {
         "status": "success",
         "message": "Product Intelligence API is running",
@@ -116,11 +109,26 @@ def root():
 
 @app.get("/health")
 def health():
+    # We intentionally check that the Supabase connection
+    # can be initialized. This catches missing environment
+    # variables on Render.
+    try:
+        get_store()
 
-    return {
-        "status": "healthy",
-        "documents": len(documents),
-    }
+        return {
+            "status": "healthy",
+            "storage": "supabase",
+        }
+
+    except Exception as exc:
+
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Supabase storage is not configured: "
+                f"{exc}"
+            ),
+        )
 
 
 # ---------------------------------------------------------
@@ -129,30 +137,23 @@ def health():
 
 @app.post("/upload")
 async def upload_document(
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
 ):
-
     if not file.filename:
-
         raise HTTPException(
             status_code=400,
             detail="No filename provided.",
         )
 
-    extension = Path(
+    original_filename = Path(
         file.filename
+    ).name
+
+    extension = Path(
+        original_filename
     ).suffix.lower()
 
-    allowed_extensions = {
-        ".pdf",
-        ".png",
-        ".jpg",
-        ".jpeg",
-        ".webp",
-    }
-
-    if extension not in allowed_extensions:
-
+    if extension not in ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=400,
             detail=(
@@ -161,35 +162,55 @@ async def upload_document(
             ),
         )
 
-    document_id = uuid4().hex
-
-    stored_filename = (
-        f"{document_id}{extension}"
+    document_id = str(
+        uuid4()
     )
 
-    file_path = (
-        UPLOAD_DIR / stored_filename
+    storage_path = (
+        f"{document_id}/"
+        f"{original_filename}"
     )
+
+    content_type = (
+        file.content_type
+        or get_content_type(
+            original_filename
+        )
+    )
+
+    store = get_store()
+
+    temp_path: Path | None = None
 
     try:
-
         content = await file.read()
 
         if not content:
-
             raise HTTPException(
                 status_code=400,
                 detail="Uploaded file is empty.",
             )
 
-        file_path.write_bytes(content)
+        # -------------------------------------------------
+        # Temporary local file for OCR/document processing
+        # -------------------------------------------------
 
-        # -----------------------------------------
-        # Process document
-        # -----------------------------------------
+        with tempfile.NamedTemporaryFile(
+            suffix=extension,
+            delete=False,
+        ) as temp_file:
+
+            temp_file.write(content)
+            temp_path = Path(
+                temp_file.name
+            )
+
+        # -------------------------------------------------
+        # Extract text / OCR
+        # -------------------------------------------------
 
         pages = extract_document(
-            str(file_path)
+            str(temp_path)
         )
 
         text_pages = [
@@ -197,14 +218,13 @@ async def upload_document(
             for page in pages
             if page.get(
                 "text",
-                ""
+                "",
             ).strip()
         ]
 
         chunks = []
 
         if text_pages:
-
             chunks = create_chunks(
                 text_pages
             )
@@ -212,7 +232,7 @@ async def upload_document(
         has_visual_content = any(
             page.get(
                 "has_images",
-                False
+                False,
             )
             or page.get(
                 "source_type"
@@ -220,62 +240,53 @@ async def upload_document(
             for page in pages
         )
 
-        if not chunks and not has_visual_content:
-
-            if file_path.exists():
-                file_path.unlink()
-
+        if (
+            not chunks
+            and not has_visual_content
+        ):
             raise HTTPException(
                 status_code=422,
                 detail=(
-                    "No readable text or visual content "
-                    "was found."
+                    "No readable text or visual "
+                    "content was found."
                 ),
             )
 
-        # -----------------------------------------
-        # Save document metadata
-        # -----------------------------------------
+        # -------------------------------------------------
+        # Persistent Supabase storage
+        # -------------------------------------------------
 
-        documents[document_id] = {
+        store.upload_file(
+            storage_path=storage_path,
+            file_bytes=content,
+            content_type=content_type,
+        )
 
-            "document_id": document_id,
+        store.create_document(
+            document_id=document_id,
+            filename=original_filename,
+            content_type=content_type,
+            pages=len(pages),
+            chunks=len(chunks),
+            visual_only=not bool(chunks),
+            storage_path=storage_path,
+        )
 
-            "original_filename": file.filename,
-
-            "stored_filename": stored_filename,
-
-            "file_path": str(file_path),
-
-            "pages": pages,
-
-            "chunks": chunks,
-
-            "visual_only": not bool(chunks),
-        }
-
-        _save_documents(
-            documents
+        store.create_chunks(
+            document_id=document_id,
+            chunks=chunks,
         )
 
         return {
-
             "status": "success",
-
             "document_id": document_id,
-
-            "filename": file.filename,
-
+            "filename": original_filename,
             "pages": len(pages),
-
             "chunks": len(chunks),
-
             "visual_only": not bool(chunks),
-
             "file_url": (
                 f"/documents/"
-                f"{document_id}"
-                f"/file"
+                f"{document_id}/file"
             ),
         }
 
@@ -284,13 +295,30 @@ async def upload_document(
 
     except Exception as exc:
 
-        if file_path.exists():
-            file_path.unlink()
+        # If the database/storage write failed after
+        # uploading the file, remove the uploaded file.
+        try:
+            store.delete_file(
+                storage_path
+            )
+        except Exception:
+            pass
 
         raise HTTPException(
             status_code=500,
             detail=str(exc),
         )
+
+    finally:
+
+        if temp_path is not None:
+
+            try:
+                temp_path.unlink(
+                    missing_ok=True
+                )
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------
@@ -300,96 +328,139 @@ async def upload_document(
 @app.get("/documents")
 def list_documents():
 
-    result = []
+    try:
+        store = get_store()
 
-    for document in documents.values():
-
-        file_path = Path(
-            document["file_path"]
+        documents = (
+            store.list_documents()
         )
 
-        result.append({
+        result = []
 
-            "document_id": document[
-                "document_id"
-            ],
+        for document in documents:
 
-            "filename": document[
-                "original_filename"
-            ],
+            document_id = document.get(
+                "id"
+            )
 
-            "pages": len(
-                document.get(
-                    "pages",
-                    []
-                )
-            ),
+            result.append(
+                {
+                    "document_id": document_id,
 
-            "chunks": len(
-                document.get(
-                    "chunks",
-                    []
-                )
-            ),
+                    "filename": document.get(
+                        "filename"
+                    ),
 
-            "visual_only": document.get(
-                "visual_only",
-                False
-            ),
+                    "content_type": document.get(
+                        "content_type"
+                    ),
 
-            "file_exists": file_path.exists(),
+                    "pages": document.get(
+                        "pages",
+                        0,
+                    ),
 
-            "file_url": (
-                f"/documents/"
-                f"{document['document_id']}"
-                f"/file"
-            ),
-        })
+                    "chunks": document.get(
+                        "chunks",
+                        0,
+                    ),
 
-    return {
-        "documents": result
-    }
+                    "visual_only": document.get(
+                        "visual_only",
+                        False,
+                    ),
+
+                    "file_url": (
+                        f"/documents/"
+                        f"{document_id}/file"
+                    ),
+
+                    "created_at": document.get(
+                        "created_at"
+                    ),
+                }
+            )
+
+        return {
+            "documents": result
+        }
+
+    except Exception as exc:
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(exc),
+        )
 
 
 # ---------------------------------------------------------
-# Serve uploaded file
+# Download stored document
 # ---------------------------------------------------------
 
 @app.get(
     "/documents/{document_id}/file"
 )
 def get_document_file(
-    document_id: str
+    document_id: str,
 ):
 
-    document = documents.get(
-        document_id
-    )
+    try:
 
-    if not document:
+        store = get_store()
 
-        raise HTTPException(
-            status_code=404,
-            detail="Document not found.",
+        document = (
+            store.get_document(
+                document_id
+            )
         )
 
-    file_path = Path(
-        document["file_path"]
-    )
+        if not document:
+            raise HTTPException(
+                status_code=404,
+                detail="Document not found.",
+            )
 
-    if not file_path.exists():
-
-        raise HTTPException(
-            status_code=404,
-            detail="Stored file not found.",
+        storage_path = document.get(
+            "storage_path"
         )
 
-    return FileResponse(
-        path=str(file_path),
-        filename=document[
-            "original_filename"
-        ],
-    )
+        if not storage_path:
+            raise HTTPException(
+                status_code=404,
+                detail="Document storage path not found.",
+            )
+
+        file_bytes = (
+            store.download_file(
+                storage_path
+            )
+        )
+
+        return Response(
+            content=file_bytes,
+            media_type=(
+                document.get(
+                    "content_type"
+                )
+                or "application/octet-stream"
+            ),
+            headers={
+                "Content-Disposition": (
+                    "inline; filename="
+                    f'"{document.get("filename", "document")}"'
+                )
+            },
+        )
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(exc),
+        )
 
 
 # ---------------------------------------------------------
@@ -398,84 +469,72 @@ def get_document_file(
 
 @app.post("/query")
 def query_product(
-    request: QueryRequest
+    request: QueryRequest,
 ):
 
     question = request.question.strip()
 
     if not question:
-
         raise HTTPException(
             status_code=400,
             detail="Question cannot be empty.",
         )
 
-    document = documents.get(
-        request.document_id
-    )
+    try:
 
-    if not document:
+        store = get_store()
 
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                "Document not found. "
-                "Upload it first."
-            ),
+        document = (
+            store.get_document(
+                request.document_id
+            )
         )
 
-    # -----------------------------------------
-    # Visual-only document
-    # -----------------------------------------
+        if not document:
 
-    if document.get(
-        "visual_only",
-        False
-    ):
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    "Document not found. "
+                    "Upload it first."
+                ),
+            )
 
-        return {
+        if document.get(
+            "visual_only",
+            False,
+        ):
 
-            "status": "visual_evidence_only",
+            return {
+                "status": "visual_evidence_only",
+                "document_id": request.document_id,
+                "question": question,
+                "confidence": 0.0,
+                "answer": None,
+                "evidence": [],
+                "message": (
+                    "The document contains visual "
+                    "content but no readable text "
+                    "was detected."
+                ),
+            }
 
-            "document_id": request.document_id,
+        chunks = (
+            store.get_chunks(
+                request.document_id
+            )
+        )
 
-            "question": question,
+        if not chunks:
 
-            "confidence": 0.0,
-
-            "answer": None,
-
-            "evidence": [],
-
-            "message": (
-                "The document contains visual content "
-                "but no readable text was detected."
-            ),
-        }
-
-    chunks = document.get(
-        "chunks",
-        []
-    )
-
-    if not chunks:
-
-        return {
-
-            "status": "no_evidence",
-
-            "document_id": request.document_id,
-
-            "question": question,
-
-            "confidence": 0.0,
-
-            "answer": None,
-
-            "evidence": [],
-        }
-
-    try:
+            return {
+                "status": "no_evidence",
+                "document_id": request.document_id,
+                "question": question,
+                "confidence": 0.0,
+                "answer": None,
+                "evidence": [],
+            }
 
         pipeline = ProductQueryPipeline(
             chunks=chunks
@@ -487,30 +546,27 @@ def query_product(
         )
 
         return {
-
             "status": result.get(
                 "status",
-                "success"
+                "success",
             ),
-
             "document_id": request.document_id,
-
             "question": question,
-
             "confidence": result.get(
                 "confidence",
-                0.0
+                0.0,
             ),
-
             "answer": result.get(
                 "answer"
             ),
-
             "evidence": result.get(
                 "evidence",
-                []
+                [],
             ),
         }
+
+    except HTTPException:
+        raise
 
     except Exception as exc:
 
