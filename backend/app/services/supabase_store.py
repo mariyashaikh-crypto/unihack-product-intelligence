@@ -46,12 +46,12 @@ class SupabaseStore:
             options["content-type"] = content_type
 
         self.client.storage.from_(
-            BUCKET_NAME
-        ).upload(
-            storage_path,
-            file_bytes,
-            options=options,
-        )
+        BUCKET_NAME
+    ).upload(
+        path=storage_path,
+        file=file_bytes,
+        file_options=options,
+    )
 
     def download_file(
         self,
