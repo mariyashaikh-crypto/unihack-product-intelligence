@@ -28,6 +28,8 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "https://unihack-product-intelligence.web.app",
+        "https://unihack-product-intelligence.firebaseapp.com",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -67,7 +69,6 @@ def _load_documents() -> dict:
         return {}
 
     try:
-
         data = json.loads(
             DOCUMENT_STORE.read_text(
                 encoding="utf-8"
